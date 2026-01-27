@@ -1,27 +1,26 @@
-name: publish
+name: Build Windows
 
 on:
-  workflow_dispatch:
   push:
     tags:
       - "v*"
 
 jobs:
-  publish-windows:
+  build-windows:
+    runs-on: windows-latest
     permissions:
       contents: write
-    runs-on: windows-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Node (LTS)
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: lts/*
-          cache: "npm"
+          cache: npm
 
-      - name: Install Rust stable
+      - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
       - name: Rust cache
@@ -29,21 +28,14 @@ jobs:
         with:
           workspaces: "./src-tauri -> target"
 
-      - name: Install frontend dependencies
+      - name: Install dependencies
         run: npm ci
 
-      # If your tauri.conf.json doesn't include beforeBuildCommand, you can build here:
-      # - name: Build frontend
-      #   run: npm run build
-
-      - name: Build and create GitHub Release (Windows)
+      - name: Build Windows app
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: "v__VERSION__"
-          releaseName: "RIFE Interpolator v__VERSION__"
-          releaseBody: "See the assets to download and install this version."
+          tagName: ${{ github.ref_name }}
+          releaseName: "RIFE Interpolator ${{ github.ref_name }}"
           releaseDraft: true
-          prerelease: false
-          args: ""
