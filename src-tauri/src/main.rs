@@ -12,6 +12,11 @@ fn emit_log_limited(app: &tauri::AppHandle, msg: &str) {
     }
 }
 
+fn emit_stage(app: &tauri::AppHandle, msg: &str) {
+    let _ = app.emit("pipeline_stage", msg.to_string());
+}
+
+
 fn parse_ffmpeg_progress_line(line: &str) -> Option<(&str, &str)> {
     let mut it = line.splitn(2, '=');
     let k = it.next()?.trim();
@@ -68,17 +73,6 @@ fn preferred_ffmpeg_path() -> Option<PathBuf> {
     None
 }
 
-fn ffmpeg_has_libwebp(ffmpeg: &Path) -> bool {
-    let out = std::process::Command::new(&ffmpeg)
-        .arg("-hide_banner")
-        .arg("-encoders")
-        .output();
-    if let Ok(o) = out {
-        let s = String::from_utf8_lossy(&o.stdout);
-        return s.to_lowercase().contains("libwebp");
-    }
-    false
-}
 
 use std::fs;
 use std::io::BufRead;
@@ -328,6 +322,49 @@ fn resolve_rife_model_path(models_root_or_model: &str) -> PathBuf {
     p
 }
 
+/// Some Windows builds of rife-ncnn-vulkan treat drive-letter absolute paths (e.g. `C:\\...`)
+/// as *relative* paths when loading model files, resulting in `_wfopen .../flownet.param failed`.
+///
+/// The most reliable way to run these builds is:
+/// - set the working directory to the directory containing the RIFE executable
+/// - pass a *relative* model folder name (e.g. `rife-v4.6`) to `-m`
+///
+/// If the selected model folder is not next to the executable, we fall back to passing an
+/// absolute path, and (on Windows) we optionally prefix with `\\?\`.
+fn compute_rife_cwd_and_model_arg(rife_bin: &Path, model_path: &Path) -> (Option<PathBuf>, std::ffi::OsString) {
+    let rife_dir = rife_bin.parent().map(|p| p.to_path_buf());
+
+    if let Some(ref dir) = rife_dir {
+        if let Some(model_parent) = model_path.parent() {
+            if model_parent == dir {
+                if let Some(name) = model_path.file_name() {
+                    return (Some(dir.clone()), name.to_os_string());
+                }
+            }
+        }
+    }
+
+    // Fallback: absolute model path.
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        // If it's already a verbatim path (\\?\), leave it.
+        let s = model_path.to_string_lossy();
+        if s.starts_with("\\\\?\\") {
+            return (rife_dir, model_path.as_os_str().to_os_string());
+        }
+        // Prefix with \\?\ to avoid drive-letter absolute path mishandling.
+        let mut wide: Vec<u16> = "\\\\?\\".encode_utf16().collect();
+        wide.extend(model_path.as_os_str().encode_wide());
+        return (rife_dir, std::ffi::OsString::from_wide(&wide));
+    }
+
+    #[cfg(not(windows))]
+    {
+        (rife_dir, model_path.as_os_str().to_os_string())
+    }
+}
+
 fn find_models_dir(dir: &Path) -> Option<PathBuf> {
     // Accept common RIFE layouts:
     // - folders like 'rife-v2.3', 'rife-v4', 'rife-anime', 'rife-UHD', etc.
@@ -469,10 +506,26 @@ fn run_rife_pipeline(
         let _ = app_for_task.emit("pipeline_log", format!("Model: {}", model_path.to_string_lossy()));
         let _ = app_for_task.emit("pipeline_log", format!("Threads (-j): {}", threads));
 
+        let (cwd, model_arg) = compute_rife_cwd_and_model_arg(&rife_bin, &model_path);
+        if let Some(ref d) = cwd {
+            let _ = app_for_task.emit(
+                "pipeline_log",
+                format!("Working dir: {}", d.to_string_lossy()),
+            );
+        }
+        let _ = app_for_task.emit(
+            "pipeline_log",
+            format!("Model arg (-m): {}", model_arg.to_string_lossy()),
+        );
+
         let mut cmd = Command::new(&rife_bin);
-        cmd.arg("-i").arg(&in_dir)
+        if let Some(d) = cwd {
+            cmd.current_dir(d);
+        }
+        cmd.arg("-v")
+            .arg("-i").arg(&in_dir)
             .arg("-o").arg(&out_dir)
-            .arg("-m").arg(&model_path)
+            .arg("-m").arg(model_arg)
             .arg("-f").arg("%08d.png")
             .arg("-j").arg(&threads)
             .stdout(Stdio::piped())
@@ -537,6 +590,8 @@ fn run_rife_pipeline(
     Ok(())
 }
 
+
+
 #[tauri::command]
 fn extract_frames(app: AppHandle, video_path: String) -> Result<ExtractFramesResult, String> {
     // IMPORTANT: non-blocking. We return immediately and run ffmpeg in a background thread.
@@ -557,8 +612,7 @@ fn extract_frames(app: AppHandle, video_path: String) -> Result<ExtractFramesRes
     let frames_dir = root.join("temp").join("frames_in").join(&job_id);
     fs::create_dir_all(&frames_dir).map_err(|e| e.to_string())?;
 
-    let use_webp = ffmpeg_has_libwebp(&ffmpeg);
-    let ext = if use_webp { "webp" } else { "png" };
+    let ext = "jpg";
     let pattern = frames_dir.join(format!("%08d.{ext}"));
 
     // Tiny, safe UI notes (no streaming logs).
@@ -578,8 +632,7 @@ fn extract_frames(app: AppHandle, video_path: String) -> Result<ExtractFramesRes
             &ffmpeg_clone,
             &input_clone,
             &frames_dir_clone,
-            &pattern_clone,
-            use_webp,
+            &pattern_clone
         ) {
             Ok(msg) => PipelineDoneEvent {
                 ok: true,
@@ -607,6 +660,11 @@ fn extract_frames(app: AppHandle, video_path: String) -> Result<ExtractFramesRes
     })
 }
 
+
+
+
+
+
 #[derive(Clone, serde::Serialize)]
 struct PipelineDoneEvent {
     ok: bool,
@@ -621,7 +679,6 @@ fn extract_frames_worker(
     input: &PathBuf,
     frames_dir: &PathBuf,
     pattern: &PathBuf,
-    use_webp: bool,
 ) -> Result<String, String> {
     let (duration_secs, fps) = probe_duration_and_fps(ffmpeg, input).unwrap_or((0.0, 0.0));
     let total_frames_est = if duration_secs > 0.0 && fps > 0.0 {
@@ -644,14 +701,26 @@ fn extract_frames_worker(
         .arg("-fps_mode").arg("passthrough")
         .arg("-progress").arg("pipe:1");
 
-    if use_webp {
-        cmd.arg("-c:v").arg("libwebp")
-            .arg("-lossless").arg("1")
-            .arg("-q:v").arg("100");
-    } else {
-        cmd.arg("-c:v").arg("png");
-    }
+// Hardware decode when available (platform default).
+let jpg_quality = 2;
 
+// hwaccel name (ffmpeg): macOS=videotoolbox, Windows=d3d11va (fallback).
+let hwaccel = if cfg!(target_os = "macos") {
+    Some("videotoolbox")
+} else if cfg!(target_os = "windows") {
+    Some("d3d11va")
+} else {
+    None
+};
+
+if let Some(hw) = hwaccel {
+    cmd.arg("-hwaccel").arg(hw);
+}
+
+// Fast path for interpolation: decode frames as JPG (much faster IO than PNG/WebP lossless).
+cmd.arg("-threads").arg("0")
+    .arg("-c:v").arg("mjpeg")
+    .arg("-q:v").arg(jpg_quality.to_string());
     cmd.arg(pattern.as_os_str())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -752,6 +821,444 @@ fn run_and_capture(mut cmd: Command) -> ToolValidation {
     }
 }
 
+
+#[tauri::command]
+fn smooth_video(
+    app: AppHandle,
+    video_path: String,
+    output_path: String,
+    max_threads: Option<i32>,
+) -> Result<ExtractFramesResult, String> {
+    // Non-blocking: returns immediately; work is done on a background thread.
+    let root = app_root(&app)?;
+    ensure_dirs(&root)?;
+
+    let (ffmpeg_path, rife_path, rife_models) = find_installed_tool_paths(&root);
+    let ffmpeg = preferred_ffmpeg_path()
+        .or(ffmpeg_path)
+        .ok_or("ffmpeg not installed (install ffmpeg first)")?;
+    let rife_bin = rife_path.ok_or("rife not installed (install rife first)")?;
+    let model_dir = rife_models.ok_or("RIFE models folder not found (install rife first)")?;
+
+    let input = PathBuf::from(video_path.trim());
+    if !input.exists() {
+        return Err("Input video does not exist".into());
+    }
+    let output = PathBuf::from(output_path.trim());
+    if output_path.trim().is_empty() {
+        return Err("Output path is required".into());
+    }
+
+    // Create a job folder
+    let job_id = format!("job-{}", chrono::Utc::now().timestamp_millis());
+    let frames_in_dir = root.join("temp").join("frames_in").join(&job_id);
+    let frames_out_dir = root.join("temp").join("frames_out").join(&job_id);
+    std::fs::create_dir_all(&frames_in_dir).map_err(|e| format!("Failed to create frames_in dir: {e}"))?;
+    std::fs::create_dir_all(&frames_out_dir).map_err(|e| format!("Failed to create frames_out dir: {e}"))?;
+
+    let pattern = frames_in_dir.join("%08d.png");
+    let frames_dir_str = frames_in_dir.to_string_lossy().to_string();
+    let frame_pattern_str = pattern.to_string_lossy().to_string();
+
+    // Make thread string for RIFE (-j x:x:x)
+    let threads = match max_threads.unwrap_or(0) {
+        t if t <= 0 => "2:2:2".to_string(),
+        t => {
+            // Clamp to sane range
+            let t = t.clamp(1, 12);
+            format!("{t}:{t}:{t}")
+        }
+    };
+
+    // Emit initial stage immediately
+    emit_stage(&app, "Extracting frames… (step 1/3)");
+    let _ = app.emit("pipeline_progress", 0.0_f64);
+    let _ = app.emit("pipeline_log", format!("Smooth Video job: {}", job_id));
+
+    let app_for_task = app.clone();
+    let ffmpeg_for_task = ffmpeg.clone();
+    let rife_for_task = rife_bin.clone();
+    let model_dir_for_task = model_dir.clone();
+    let input_for_task = input.clone();
+    let output_for_task = output.clone();
+    let frames_in_for_task = frames_in_dir.clone();
+    let frames_out_for_task = frames_out_dir.clone();
+    let threads_for_task = threads.clone();
+    let frames_dir_for_task = frames_dir_str.clone();
+    let frame_pattern_for_task = frame_pattern_str.clone();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        // STEP 1: Extract frames
+        let _ = app_for_task.emit("pipeline_log", format!("FFmpeg: {}", ffmpeg_for_task.to_string_lossy()));
+        let _ = app_for_task.emit("pipeline_log", format!("Input: {}", input_for_task.to_string_lossy()));
+        let _ = app_for_task.emit("pipeline_log", format!("Frames in: {}", frames_in_for_task.to_string_lossy()));
+
+        let mut cmd = Command::new(&ffmpeg_for_task);
+        cmd.arg("-hide_banner").arg("-y")
+            .arg("-i").arg(&input_for_task)
+            // png is a good middle-ground for now
+            .arg("-vsync").arg("0")
+            .arg(frames_in_for_task.join("%08d.png"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = app_for_task.emit("pipeline_done", PipelineDoneEvent {
+                    ok: false,
+                    message: format!("FFmpeg failed to start: {e}"),
+                    frames_dir: frames_dir_for_task.clone(),
+                    frame_pattern: frame_pattern_for_task.clone(),
+                });
+                return;
+            }
+        };
+
+        // stream ffmpeg stderr lightly
+        if let Some(stderr) = child.stderr.take() {
+            let reader = std::io::BufReader::new(stderr);
+            for line in reader.lines().flatten() {
+                let line = line.trim().to_string();
+                if !line.is_empty() {
+                    let _ = app_for_task.emit("pipeline_log", line);
+                }
+            }
+        }
+        let ok = child.wait().map(|s| s.success()).unwrap_or(false);
+        if !ok {
+            let _ = app_for_task.emit("pipeline_done", PipelineDoneEvent {
+                ok: false,
+                message: "Frame extraction failed".into(),
+                frames_dir: frames_dir_for_task.clone(),
+                frame_pattern: frame_pattern_for_task.clone(),
+            });
+            return;
+        }
+
+        // Count frames
+        let in_count = count_files_in_dir(&frames_in_for_task).max(1) as f64;
+
+        // STEP 2: RIFE
+        emit_stage(&app_for_task, "Interpolating (RIFE)… (step 2/3)");
+        let _ = app_for_task.emit("pipeline_log", format!("RIFE: {}", rife_for_task.to_string_lossy()));
+        let _ = app_for_task.emit("pipeline_log", format!("Model dir: {}", model_dir_for_task.to_string_lossy()));
+        let _ = app_for_task.emit("pipeline_log", format!("Threads (-j): {}", threads_for_task));
+
+        let (cwd, model_arg) = compute_rife_cwd_and_model_arg(&rife_for_task, &model_dir_for_task);
+        let mut rife_cmd = Command::new(&rife_for_task);
+        if let Some(d) = cwd {
+            rife_cmd.current_dir(d);
+        }
+        rife_cmd.arg("-v")
+            .arg("-i").arg(&frames_in_for_task)
+            .arg("-o").arg(&frames_out_for_task)
+            .arg("-m").arg(model_arg)
+            .arg("-f").arg("%08d.png")
+            .arg("-j").arg(&threads_for_task)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut rife_child = match rife_cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = app_for_task.emit("pipeline_done", PipelineDoneEvent {
+                    ok: false,
+                    message: format!("RIFE failed to start: {e}"),
+                    frames_dir: frames_dir_for_task.clone(),
+                    frame_pattern: frame_pattern_for_task.clone(),
+                });
+                return;
+            }
+        };
+
+        // stream logs from RIFE stderr on a background thread (prevents pipe buffer deadlocks)
+        use std::sync::{Arc, Mutex};
+        let stderr_tail: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let stderr_tail_for_thread = stderr_tail.clone();
+
+        let stderr_handle = rife_child.stderr.take().map(|st| {
+            let app = app_for_task.clone();
+            std::thread::spawn(move || {
+                let reader = std::io::BufReader::new(st);
+                for line in reader.lines().flatten() {
+                    let line = line.trim().to_string();
+                    if line.is_empty() { continue; }
+                    // keep a small tail for error reporting
+                    {
+                        let mut t = stderr_tail_for_thread.lock().unwrap();
+                        t.push(line.clone());
+                        let len = t.len();
+                        if len > 64 {
+                            t.drain(0..(len - 64));
+                        }
+                    }
+                    let _ = app.emit("pipeline_log", line);
+                }
+            })
+        });
+
+        // update progress based on output frame count while RIFE runs
+        while rife_child.try_wait().ok().flatten().is_none() {
+            let out_count = count_files_in_dir(&frames_out_for_task) as f64;
+            // For 2x interpolation, output is roughly ~2x input frames. Clamp to the middle-third segment.
+            let pct = 33.0 + ((out_count / (in_count * 2.0)) * 33.0).max(0.0).min(33.0);
+            let _ = app_for_task.emit("pipeline_progress", pct);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+
+        // ensure stderr thread finishes draining
+        if let Some(h) = stderr_handle {
+            let _ = h.join();
+        }
+
+        let ok = rife_child.wait().map(|s| s.success()).unwrap_or(false);
+        if !ok {
+            let tail = {
+                let t = stderr_tail.lock().unwrap();
+                t.iter().rev().take(8).cloned().collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n")
+            };
+            let msg = if tail.trim().is_empty() { "RIFE failed".into() } else { tail };
+            let _ = app_for_task.emit("pipeline_done", PipelineDoneEvent {
+                ok: false,
+                message: msg,
+                frames_dir: frames_dir_for_task.clone(),
+                frame_pattern: frame_pattern_for_task.clone(),
+            });
+            return;
+        }
+
+        // STEP 3: Encode video
+        emit_stage(&app_for_task, "Encoding video… (step 3/3)");
+        let out_pattern = frames_out_for_task.join("%08d.png");
+        let mut enc = Command::new(&ffmpeg_for_task);
+        enc.arg("-hide_banner").arg("-y")
+            .arg("-framerate").arg("30")
+            .arg("-i").arg(out_pattern)
+            .arg("-c:v").arg("libx264")
+            .arg("-pix_fmt").arg("yuv420p")
+            .arg(&output_for_task)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+
+        let mut enc_child = match enc.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = app_for_task.emit("pipeline_done", PipelineDoneEvent {
+                    ok: false,
+                    message: format!("Encode failed to start: {e}"),
+                    frames_dir: frames_dir_for_task.clone(),
+                    frame_pattern: frame_pattern_for_task.clone(),
+                });
+                return;
+            }
+        };
+
+        if let Some(stderr) = enc_child.stderr.take() {
+            let reader = std::io::BufReader::new(stderr);
+            for line in reader.lines().flatten() {
+                let line = line.trim().to_string();
+                if !line.is_empty() {
+                    let _ = app_for_task.emit("pipeline_log", line);
+                }
+            }
+        }
+        let ok = enc_child.wait().map(|s| s.success()).unwrap_or(false);
+        if !ok {
+            let _ = app_for_task.emit("pipeline_done", PipelineDoneEvent {
+                ok: false,
+                message: "Encoding failed".into(),
+                frames_dir: frames_dir_for_task.clone(),
+                frame_pattern: frame_pattern_for_task.clone(),
+            });
+            return;
+        }
+
+        let _ = app_for_task.emit("pipeline_progress", 100.0_f64);
+        let _ = app_for_task.emit("pipeline_done", PipelineDoneEvent {
+            ok: true,
+            message: format!("Done: {}", output_for_task.to_string_lossy()),
+            frames_dir: frames_dir_for_task.clone(),
+            frame_pattern: frame_pattern_for_task.clone(),
+        });
+    });
+
+    Ok(ExtractFramesResult {
+        ok: true,
+        frames_dir: frames_dir_str,
+        frame_pattern: frame_pattern_str,
+        output: output.to_string_lossy().to_string(),
+    })
+}
+
+#[tauri::command]
+fn reencode_only(
+    app: AppHandle,
+    video_path: String,
+    output_path: String,
+    frames_dir: Option<String>,
+    max_threads: Option<i32>,
+) -> Result<ExtractFramesResult, String> {
+    // Non-blocking: returns immediately; work is done on a background thread.
+    let root = app_root(&app)?;
+    ensure_dirs(&root)?;
+
+    let (ffmpeg_path, _rife_path, _rife_models) = find_installed_tool_paths(&root);
+    let ffmpeg = preferred_ffmpeg_path()
+        .or(ffmpeg_path)
+        .ok_or("ffmpeg not installed (install ffmpeg first)")?;
+
+    let input = PathBuf::from(video_path.trim());
+    if !input.exists() {
+        return Err("Input video does not exist".into());
+    }
+
+    let output = PathBuf::from(output_path.trim());
+    if output_path.trim().is_empty() {
+        return Err("Output path is required".into());
+    }
+
+    let frames_dir_str = frames_dir.unwrap_or_default().trim().to_string();
+    if frames_dir_str.is_empty() {
+        return Err("Frames folder is required for re-encode only".into());
+    }
+    let frames_dir_path = PathBuf::from(&frames_dir_str);
+    if !frames_dir_path.exists() {
+        return Err("Frames folder does not exist".into());
+    }
+
+    let pattern = frames_dir_path.join("%08d.png");
+    let frame_pattern_str = pattern.to_string_lossy().to_string();
+
+    // Estimate total frames for progress
+    let total_frames_est = count_files_in_dir(&frames_dir_path).max(0) as i64;
+
+    let (_dur, fps_in) = probe_duration_and_fps(&ffmpeg, &input).unwrap_or((0.0, 30.0));
+    let fps_out = (fps_in * 2.0).max(1.0);
+    let fps_out_str = format!("{:.6}", fps_out);
+
+    let output_ext = output
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    let app_for_task = app.clone();
+    let input_for_task = input.clone();
+    let output_for_task = output.clone();
+    let frames_dir_for_task = frames_dir_str.clone();
+    let frame_pattern_for_task = frame_pattern_str.clone();
+    let ffmpeg_for_task = ffmpeg.clone();
+    let max_threads_for_task = max_threads.unwrap_or(0);
+
+    std::thread::spawn(move || {
+        let _ = app_for_task.emit("pipeline_progress", 0.0_f64);
+        emit_log_limited(&app_for_task, "Re-encode only: starting ffmpeg…");
+
+        let mut cmd = Command::new(&ffmpeg_for_task);
+        cmd.arg("-hide_banner").arg("-y");
+
+        if max_threads_for_task > 0 {
+            cmd.arg("-threads").arg(max_threads_for_task.to_string());
+        }
+
+        cmd.arg("-progress").arg("pipe:1")
+            .arg("-nostats")
+            .arg("-framerate").arg(&fps_out_str)
+            .arg("-i").arg(&frame_pattern_for_task)
+            .arg("-i").arg(&input_for_task)
+            .arg("-map").arg("0:v:0")
+            .arg("-map").arg("1:a:0?")
+            .arg("-c:v").arg("libx264")
+            .arg("-preset").arg("ultrafast")
+            .arg("-crf").arg("18");
+
+        // Audio: Opus-in-MP4 can be finicky; AAC is safest for mp4/mov.
+        if output_ext == "mp4" || output_ext == "mov" || output_ext == "m4v" {
+            cmd.arg("-c:a").arg("aac").arg("-b:a").arg("192k");
+        } else {
+            cmd.arg("-c:a").arg("copy");
+        }
+
+        cmd.arg("-shortest").arg(&output_for_task)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = app_for_task.emit("pipeline_done", PipelineDoneEvent {
+                    ok: false,
+                    message: format!("ffmpeg failed to start: {e}"),
+                    frames_dir: frames_dir_for_task.clone(),
+                    frame_pattern: frame_pattern_for_task.clone(),
+                });
+                return;
+            }
+        };
+
+        // stderr -> log
+        if let Some(stderr) = child.stderr.take() {
+            let app_log = app_for_task.clone();
+            std::thread::spawn(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines().flatten() {
+                    emit_log_limited(&app_log, &line);
+                }
+            });
+        }
+
+        // stdout (-progress) -> progress percent
+        let mut last_emit = std::time::Instant::now();
+        if let Some(stdout) = child.stdout.take() {
+            let reader = BufReader::new(stdout);
+            let mut frame: i64 = 0;
+            for line in reader.lines().flatten() {
+                let line = line.trim().to_string();
+                if line.is_empty() { continue; }
+                if let Some((k, v)) = line.split_once('=') {
+                    if k == "frame" {
+                        frame = v.parse::<i64>().unwrap_or(frame);
+                    }
+                    if last_emit.elapsed().as_millis() >= 250 {
+                        if total_frames_est > 0 && frame > 0 {
+                            let pct = ((frame as f64 / total_frames_est as f64) * 100.0).min(99.9);
+                            let _ = app_for_task.emit("pipeline_progress", pct);
+                        }
+                        last_emit = std::time::Instant::now();
+                    }
+                }
+            }
+        }
+
+        let ok = child.wait().map(|s| s.success()).unwrap_or(false);
+        if ok {
+            let _ = app_for_task.emit("pipeline_progress", 100.0_f64);
+            let _ = app_for_task.emit("pipeline_done", PipelineDoneEvent {
+                ok: true,
+                message: format!("Done: {}", output_for_task.to_string_lossy()),
+                frames_dir: frames_dir_for_task.clone(),
+                frame_pattern: frame_pattern_for_task.clone(),
+            });
+        } else {
+            let _ = app_for_task.emit("pipeline_done", PipelineDoneEvent {
+                ok: false,
+                message: "Re-encode failed".into(),
+                frames_dir: frames_dir_for_task.clone(),
+                frame_pattern: frame_pattern_for_task.clone(),
+            });
+        }
+    });
+
+    Ok(ExtractFramesResult {
+        ok: true,
+        frames_dir: frames_dir_str,
+        frame_pattern: frame_pattern_str,
+        output: output.to_string_lossy().to_string(),
+    })
+}
+
+
 #[tauri::command]
 fn validate_tools(app: AppHandle) -> Result<ValidateToolsResult, String> {
     let root = app_root(&app)?;
@@ -824,6 +1331,8 @@ fn main() {
             install_tool,
             validate_tools,
             extract_frames,
+            smooth_video,
+            reencode_only,
             get_max_threads_string,
             get_default_rife_model_dir,
             run_rife_pipeline
